@@ -1,0 +1,137 @@
+services:
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.18
+    container_name: glodex-etcd
+    command:
+      - etcd
+      - --advertise-client-urls=http://127.0.0.1:2379
+      - --listen-client-urls=http://0.0.0.0:2379
+      - --data-dir=/etcd
+    environment:
+      ETCD_AUTO_COMPACTION_MODE: revision
+      ETCD_AUTO_COMPACTION_RETENTION: "1000"
+      ETCD_QUOTA_BACKEND_BYTES: "4294967296"
+      ETCD_SNAPSHOT_COUNT: "50000"
+    volumes:
+      - glodex_etcd_data:/etcd
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+      start_period: 10s
+
+  minio:
+    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+    container_name: glodex-minio
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: glodex
+      MINIO_ROOT_PASSWORD: glodex_minio_password
+      TZ: Asia/Shanghai
+    volumes:
+      - glodex_minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+      start_period: 10s
+
+  milvus:
+    image: milvusdb/milvus:v2.5.27
+    container_name: glodex-milvus
+    command: ["milvus", "run", "standalone"]
+    environment:
+      ETCD_ENDPOINTS: etcd:2379
+      MINIO_ADDRESS: minio:9000
+      MINIO_ACCESS_KEY_ID: glodex
+      MINIO_SECRET_ACCESS_KEY: glodex_minio_password
+      TZ: Asia/Shanghai
+    volumes:
+      - glodex_milvus_data:/var/lib/milvus
+    ports:
+      - "19530:19530"
+      - "9091:9091"
+    depends_on:
+      etcd:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
+      interval: 30s
+      timeout: 20s
+      retries: 5
+      start_period: 90s
+
+  redis:
+    image: redis:7.2.14
+    container_name: glodex-redis
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - glodex_redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  mysql:
+    image: mysql:8.4.10
+    container_name: glodex-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: glodex_root_password
+      MYSQL_DATABASE: glodex_agent
+      MYSQL_USER: glodex
+      MYSQL_PASSWORD: glodex_password
+      TZ: Asia/Shanghai
+    ports:
+      - "3306:3306"
+    volumes:
+      - glodex_mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-pglodex_root_password"]
+      interval: 30s
+      timeout: 20s
+      retries: 5
+      start_period: 30s
+
+  app:
+    image: glodex-agent-app:py3.12.3
+    container_name: glodex-app
+    command: ["sleep", "infinity"]
+    working_dir: /workspace
+    environment:
+      MILVUS_HOST: milvus
+      MILVUS_PORT: "19530"
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: glodex
+      MINIO_SECRET_KEY: glodex_minio_password
+      REDIS_URL: redis://redis:6379/0
+      MYSQL_HOST: mysql
+      MYSQL_PORT: "3306"
+      MYSQL_DATABASE: glodex_agent
+      MYSQL_USER: glodex
+      MYSQL_PASSWORD: glodex_password
+      TZ: Asia/Shanghai
+    ports:
+      - "8000:8000"
+    volumes:
+      - .:/workspace
+    depends_on:
+      milvus:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      mysql:
+        condition: service_healthy
+
+volumes:
+  glodex_etcd_data:
+  glodex_minio_data:
+  glodex_milvus_data:
+  glodex_redis_data:
+  glodex_mysql_data:
