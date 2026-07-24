@@ -32,33 +32,6 @@ ItemSearch
 - 用户长期偏好
 - `CategoryInsight` 输出结果
 
-当前项目面向国内电商，候选商品字段不能假设完整。`ItemPicker` 只把 `item_id`、`platform`、`title` 视为稳定字段，其他字段都按可选处理：
-
-- `price_cny`
-- `shipping_fee_cny`
-- `free_shipping`
-- `eta_days`
-- `shop_name`
-- `shop_type`
-- `rating`
-- `sales`
-- `attributes`
-- `tags`
-
-字段缺失时不默认淘汰商品；只有明确违反用户硬约束时才排除。无法判断的信息会进入 `flags`，例如“材质未知，需二次确认”。
-
-### 2.1.1 国内版核心逻辑
-
-`ItemPicker` 的筛选顺序：
-
-1. 先检查硬约束，例如“不要塑料”“必须包邮”“不要预售”“只要自营”“预算上限”。
-2. 明确违反硬约束的商品直接进入 `rejected_brief`。
-3. 字段缺失导致无法判断时不直接排除，只添加风险标记。
-4. 对剩余商品按价格、包邮、配送时效、评分、销量、店铺可信度、用户软偏好和品类洞察打分。
-5. 按综合分排序，默认返回最多 3 件商品。
-
-跨境场景中的关税、免税、跨境直邮等字段当前不进入国内版核心逻辑。
-
 ### 2.2 和 CategoryInsight 的关系
 
 `CategoryInsight` 给 `ItemPicker` 提供品类常识。
@@ -94,16 +67,6 @@ ItemSearch
 - 关键优缺点
 - 不推荐商品的简要原因
 - 最终购买建议
-
-当前实现中，`ShoppingSummary` 接收 `ItemPicker` 的 `PickedItem` 列表和用户原始需求，调用 LLM 生成 Markdown 最终答复。它是终结性工具，一旦被调用，主 AgentLoop 应认为购物链路已经进入收敛阶段，不应该再发起新的搜索或筛选动作。
-
-输出结构：
-
-- `final_text`：给前端展示的最终 Markdown。
-- `picks`：本次最终推荐的精选商品。
-- `learned_preferences`：本轮识别出的新偏好，后续可写入长期记忆 Store。
-
-国内版总结只关注商品、平台、价格、推荐理由和风险提示，不输出关税、跨境直邮、免税等跨境信息。
 
 ### 3.2 ShoppingSummary 不做的事
 

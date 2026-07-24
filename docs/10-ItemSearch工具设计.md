@@ -8,19 +8,122 @@
 
 ```text
 用户购物意图
--> Planner 拆解（预算 / 品类 / 偏好）
+-> Planner 拆解（预算 / 品类 / 配送偏好 / 包邮需求）
 -> 主 AgentLoop 在 Think 阶段判断："要跨多个国内平台"
 -> dispatch_tool fork 多个同质子 AgentLoop
-    ├─ 子 A: 调 item_search(platform="taobao", ...)
-    ├─ 子 B: 调 item_search(platform="jd", ...)
-    └─ 子 C: 调 item_search(platform="pdd", ...)
+    ├─ 子 A: 调 item_search(platform="jd", ...)      # 京东联盟官方
+    ├─ 子 B: 调 item_search(platform="pdd", ...)     # 多多进宝官方
+    └─ 子 C: 调 item_search(platform="taobao", ...)  # 万邦聚合补充淘宝
 -> 多份商品候选合流回主 loop
--> ItemPicker / ShoppingSummary
+-> PriceCompare / ItemPicker / ShoppingSummary
 ```
 
-平台不固定三个，主 AgentLoop 可根据用户需求动态决定 fork 哪些平台。
+这里的平台不是固定三个。只要是国内平台或国内商品数据源，都可以作为 `ItemSearch` 的搜索来源。主 AgentLoop 可以根据用户需求、平台可用性和配置，动态决定 fork 哪些平台。
 
-## 二、工具职责
+如果成熟版已经有完整、足够新的统一商品库，那么主 loop 不一定需要 fork 多个子 Agent 分平台实时搜索。此时可以直接查统一商品库 / Milvus，平台只是过滤字段，例如 `platform in ["jd", "pdd", "taobao"]`。
+
+分平台子 Agent 的价值主要在商品库不完整或需要实时校验时：
+
+- 某个平台商品没有同步进库。
+- 价格、库存、优惠券、运费信息可能过期。
+- 用户 query 很长尾，库内召回不足。
+- 需要临时补某个平台的实时结果。
+
+因此成熟系统更适合混合路线：
+
+```text
+统一商品库 / Milvus = 主召回
+分平台子 Agent = 实时补数 / 兜底校验
+```
+
+如果库内结果够多、够新，就不 fork；如果某个平台缺数据或字段过期，再 fork 对应平台子 Agent 去补。
+
+## 二、主 Loop Prompt 与 dispatch_tool
+
+主 loop 的 prompt 要明确告诉模型：当下一步子任务能并行时，应该调用 `dispatch_tool(demands="...")`。
+
+```text
+当下一步子任务满足以下任一条件，你应该调 dispatch_tool(demands="..."):
+1. 能并行：多个独立检索可以同时跑（如跨多个国内平台 ItemSearch）
+```
+
+模型在 Think 阶段可以产出多个工具调用：
+
+```text
+dispatch_tool(demands="在 jd 上搜：旅行收纳袋 不要塑料 小众 预算300")
+dispatch_tool(demands="在 pdd 上搜：旅行收纳袋 不要塑料 小众 预算300")
+dispatch_tool(demands="在 taobao 上搜：旅行收纳袋 不要塑料 小众 预算300")
+```
+
+每个 `dispatch_tool` 调用 fork 一个同质子 AgentLoop。子 loop 内部 Think 一次后调 `item_search(platform="...")`，拿到结果返回主 loop。
+
+### dispatch_tool 的并发实现
+
+`dispatch_tool` 是单次 fork。多个 fork 真正并发，靠主 loop 的 LLM 在一次回复里返回多个 `tool_call`，LangGraph 会用 `asyncio.gather` 同时执行。
+
+```python
+# app/agent/dispatch_tool.py（节选）
+from uuid import uuid4
+from langchain_core.tools import tool
+from app.agent.llm import get_llm
+from app.agent.prompts import get_system_prompt
+from app.api.context import _thread_id_var, _session_dir_var, get_session_dir
+from app.api.monitor import monitor
+from langgraph.prebuilt import create_react_agent
+
+
+@tool
+async def dispatch_tool(demands: str) -> str:
+    """派一个同质子AgentLoop 去执行 demands，返回它的最终回复。
+    适用条件（任一即可）：
+    1. 能并行：多个子任务可以同时跑
+    2. 上下文要隔离：子任务输出很大，不应污染主 loop
+    3. 调用链 >= 3：子任务自己内部还要多轮 Think -> Act
+    """
+    sub_thread_id = f"sub-{uuid4().hex[:8]}"
+    parent_session_dir = get_session_dir()
+    await monitor.report_fork(sub_thread_id, demands)
+
+    sub_agent = create_react_agent(
+        model=get_llm(),
+        tools=FULL_TOOL_SET,        # 同质：和主 loop 同一份工具集
+        prompt=get_system_prompt(), # 同质：同一段 system prompt
+    )
+
+    token_t = _thread_id_var.set(sub_thread_id)
+    token_s = _session_dir_var.set(parent_session_dir)
+    try:
+        result = await sub_agent.ainvoke(
+            {"messages": [("user", demands)]},
+            config={"configurable": {"thread_id": sub_thread_id}},
+        )
+        return result["messages"][-1].content
+    finally:
+        _thread_id_var.reset(token_t)
+        _session_dir_var.reset(token_s)
+```
+
+注意：`FULL_TOOL_SET` 里包含 `dispatch_tool` 自己，子 Agent 理论上也能再往下 fork。后续需要用 `max_depth` 防止 fork 链失控。
+
+### 什么时候不 fork
+
+如果用户说：
+
+```text
+只在淘宝上找带壶嘴的咖啡杯。
+```
+
+只有一个平台、一个 query。
+
+| 条件 | 判断 |
+| --- | --- |
+| 能并行 | 否 |
+| 上下文要隔离 | 否，20 件候选不算大 |
+| 调用链 >= 3 | 否 |
+
+这时主 loop 直接调 `item_search`，不 fork。AGUI 事件流会更短，没有 fork 事件，前端展示就是一条直链。
+
+## 三、工具职责
 
 `ItemSearch` 只负责一件事：
 
@@ -29,336 +132,406 @@
 它应该做：
 
 - 根据 `query` 搜商品。
-- 按 `platform` 调用麦手 API 搜索接口。
-- 返回候选商品列表（search 接口返回的 10 个基础字段）。
-- 异步批量补全 `url`（购买链接/口令，来自 detail 接口）。
-- 异步批量补全 `attributes`（多模态模型读图 + 读标题，提取结构化属性）。
-- 后续 `_search_local_index` 替换为 Milvus 混合召回：title 关键词检索 + embedding 向量检索。
+- 按 `platform` 调用对应平台数据源。
+- 返回候选商品列表。
+- 标准化标题、价格、平台、链接、图片、店铺、销量、评分等字段。
+- 带回国内运费、包邮、配送时效等基础信息。
 
 它不应该做：
 
 - 不做最终推荐。
 - 不做复杂主观筛选。
 - 不写采购清单。
+- 不单独计算关税。
 - 不负责完整跨平台同款归并。
 
-## 三、数据来源
+国内场景先移除独立 `ShippingCalc`：没有跨境关税逻辑，普通运费、包邮、配送时效合并进 `ItemSearch` 的商品字段，以及后续 `PriceCompare` 的总价计算。
 
-统一使用麦手 API（`appapi.maishou88.com`），一个 API 同时覆盖淘宝/京东/拼多多。
+## 四、国内平台来源
 
-| 平台 | platform | sourceType | 说明 |
-| --- | --- | --- | --- |
-| 淘宝 | `taobao` | 1 | 含天猫商品 |
-| 京东 | `jd` | 2 | 含京东自营和第三方 |
-| 拼多多 | `pdd` | 3 | 含多多进宝商品 |
+第一批优先国内平台：
 
-以后可继续加入抖音电商、小红书、1688 等平台，只需扩展 sourceType 即可。
-
-### 3.1 search 接口
-
-```
-POST https://appapi.maishou88.com/api/v1/homepage/searchList
-```
-
-返回字段：
-
-| 字段 | 说明 |
-| --- | --- |
-| goodsId | 商品 ID，全局唯一 |
-| sourceType | 1:淘宝 2:京东 3:拼多多 |
-| title | 商品标题 |
-| shopName | 店铺名 |
-| originalPrice | 原价（元） |
-| actualPrice | 券后价（元） |
-| couponPrice | 优惠券金额（元） |
-| commission | 佣金（元） |
-| monthSales | 月销量 |
-| picUrl | 主图 CDN 链接（公网可访问） |
-
-### 3.2 detail 接口
-
-```
-POST https://appapi.maishou88.com/api/v3/goods/detail
-POST https://msapi.maishou88.com/api/v1/share/getTargetUrl
-```
-
-补全以下字段：
-
-| 字段 | 来源 | 说明 |
+| 平台 | platform | 来源策略 |
 | --- | --- | --- |
-| url / kl | getTargetUrl | 购买链接（appUrl/schemaUrl）+ 复制口令（kl） |
-| detail | goods/detail | 商品详情原始 JSON，仅用于字段补全和 attributes 生成，不入库 |
+| 京东 | `jd` | 京东联盟官方 |
+| 拼多多 | `pdd` | 多多进宝官方 |
+| 淘宝 / 天猫 | `taobao` / `tmall` | 万邦聚合补充淘宝 |
+| 1688 | `1688` | 后续接入 |
+| Mock | `mock` | 本地开发测试 |
 
-## 四、商品入库统一结构
+平台集合保持开放。后续可以继续加入抖音电商、小红书、得物、唯品会、苏宁等国内平台。
 
-入库 Milvus 前使用 `NormalizedProduct` 标准化。精简为 **11 个固定字段 + 1 个动态属性字段 + 1 段向量化文本 + 1 个向量字段**，只保留检索和推荐真正需要的内容。
+## 五、工具代码结构
 
-### 4.1 固定字段（11 个，来自 API 原生返回）
-
-| 字段 | 类型 | Milvus dtype | 来源 | 说明 |
-| --- | --- | --- | --- | --- |
-| item_id | str | VARCHAR(128) PRIMARY | goodsId | 商品唯一 ID |
-| platform | enum | VARCHAR(32) | sourceType 映射 | taobao / jd / pdd |
-| title | str | VARCHAR(512) | title（API 直接返回） | 商品标题，embedding 文本主来源 |
-| price_cny | float | FLOAT | originalPrice | 标价（元） |
-| coupon_cny | float | FLOAT | couponPrice | 优惠券金额（元） |
-| final_price_cny | float | FLOAT | actualPrice | 券后价（元） |
-| shop_name | str | VARCHAR(256) | shopName | 店铺名，embedding 文本来源 |
-| sales | int | INT64 | monthSales | 月销量 |
-| image_url | str | VARCHAR(1024) | picUrl | 主图 CDN 链接，多模态读图输入 |
-| url | str | VARCHAR(1024) | detail 接口 getTargetUrl | 购买链接 / 口令 |
-
-### 4.2 扩展动态字段（1 个，多模态模型提取）
-
-| 字段 | 类型 | Milvus dtype | 来源 | 说明 |
-| --- | --- | --- | --- | --- |
-| attributes_json | JSON | JSON | 多模态模型（图 + 文） | 结构化商品属性，不限字段数 |
-
-attributes 不预定义字段名，不同品类提取不同属性。示例（内存条）：
-
-```json
-{
-  "颜色": "白色",
-  "容量": "32GB(16GB×2)",
-  "代数": "DDR5",
-  "频率": "6000MHz",
-  "时序": "C28",
-  "灯效": "RGB",
-  "颗粒": "海力士 A-die",
-  "散热": "马甲条",
-  "适用": "台式机"
-}
-```
-
-### 4.3 向量化字段
-
-| 字段 | 类型 / 维度 | 说明 |
-| --- | --- | --- |
-| embedding_text | VARCHAR(4096) | `title + shop_name + attributes(key:value)`，用于生成商品向量，也便于排查 |
-| embedding | FLOAT_VECTOR(1024) | 由 embedding / Item Tower 生成，索引类型 IVF_FLAT，度量 COSINE |
-
-embedding 文本拼接逻辑（入库时调用 `NormalizedProduct.embedding_text()`）：
+`item_search` 支持单个平台搜索。多平台并发由主 AgentLoop 通过 `dispatch_tool` fork 多个同质子 AgentLoop 完成。
 
 ```python
-def embedding_text(self) -> str:
-    """拼接 title + shop_name + attributes 做向量化文本。"""
-    attr_text = " ".join(f"{k}:{v}" for k, v in self.attributes.items())
-    return " ".join(p for p in [self.title, self.shop_name or "", attr_text] if p)
-```
+# app/tools/item_search.py
+from langchain_core.tools import tool
+from pydantic import BaseModel, Field
+from typing import Literal
 
-示例 embedding 文本：
 
-> `金百达 32GB(16G×2) 套装 DDR5 6000 台式机内存条 金百达京东自营旗舰店 容量:32GB 代数:DDR5 频率:6000MHz 时序:C28 灯效:RGB 颗粒:海力士A-die 散热:马甲条`
-
-### 4.4 不入库字段
-
-`raw` 不进入 Milvus。麦手 search/detail 的完整原始响应只用于调试、临时日志和字段补全；正式入库只保留标准字段。
-
-### 4.5 被砍掉的字段及原因
-
-| 旧字段 | 砍掉原因 |
-| --- | --- |
-| raw | 原始响应体积大，且检索/推荐不直接依赖；需要排查时保留临时日志即可 |
-| shipping_fee_cny | 麦手 API 不返回运费数据，纯电商场景暂不需要 |
-| free_shipping | 同上，API 无此字段 |
-| eta_days | API 无配送时效数据 |
-| shop_type | API 不返回店铺类型（自营/旗舰/普通），无法可靠区分 |
-| rating | API 不返回评分 |
-| category | 标题已包含品类信息，且多模态可提取更精确的分类 |
-| tags | 无上游数据源，由 attributes 覆盖标签需求 |
-
-## 五、多模态属性提取流程
-
-```
-item_search 调用
-  -> 麦手 search API → 批量获取 picUrl + title
-  -> 并发调用多模态模型（图: picUrl + 文: title）
-  -> 模型返回结构化 JSON（品类相关属性）
-  -> 写入 attributes 字段
-  -> 入库 Milvus
-```
-
-多模态 prompt 示例（以内存条为例）：
-
-```text
-你是一个电商商品属性提取器。根据商品图片和标题，提取以下结构化属性，
-只返回 JSON，不要额外文字。
-
-品类：内存条
-提取字段：颜色、容量、代数(DDR4/DDR5)、频率、时序、灯效(RGB/无)、
-         颗粒品牌、散热(马甲条/裸条)、适用(台式机/笔记本)
-
-图片: <picUrl>
-标题: 金百达 32GB(16G×2) 套装 DDR5 6000 台式机内存条 C28 RGB
-```
-
-模型输出：
-
-```json
-{
-  "颜色": "白色",
-  "容量": "32GB(16GB×2)",
-  "代数": "DDR5",
-  "频率": "6000MHz",
-  "时序": "C28",
-  "灯效": "RGB",
-  "颗粒": "海力士 A-die",
-  "散热": "马甲条",
-  "适用": "台式机"
-}
-```
-
-不同品类使用不同的提取字段定义即可，无需改 schema。
-
-## 六、Milvus Collection Schema
-
-```json
-{
-  "collection_name": "glodex_items",
-  "fields": [
-    { "name": "item_id",           "dtype": "VARCHAR",  "max_length": 128,  "is_primary": true },
-    { "name": "platform",          "dtype": "VARCHAR",  "max_length": 32 },
-    { "name": "title",             "dtype": "VARCHAR",  "max_length": 512 },
-    { "name": "price_cny",         "dtype": "FLOAT" },
-    { "name": "coupon_cny",        "dtype": "FLOAT" },
-    { "name": "final_price_cny",   "dtype": "FLOAT" },
-    { "name": "shop_name",         "dtype": "VARCHAR",  "max_length": 256 },
-    { "name": "sales",             "dtype": "INT64" },
-    { "name": "image_url",         "dtype": "VARCHAR",  "max_length": 1024 },
-    { "name": "url",               "dtype": "VARCHAR",  "max_length": 1024 },
-    { "name": "attributes_json",   "dtype": "JSON" },
-    { "name": "embedding_text",    "dtype": "VARCHAR",  "max_length": 4096 },
-    { "name": "embedding",         "dtype": "FLOAT_VECTOR", "dim": 1024 }
-  ],
-  "index_params": [
-    { "field_name": "embedding",   "index_type": "IVF_FLAT", "metric_type": "COSINE", "params": { "nlist": 128 } },
-    { "field_name": "item_id",     "index_type": "Trie" },
-    { "field_name": "platform",    "index_type": "Trie" },
-    { "field_name": "price_cny",   "index_type": "STL_SORT" },
-    { "field_name": "sales",       "index_type": "STL_SORT" }
-  ]
-}
-```
-
-title 字段保留为关键词检索入口；embedding 字段用于语义向量召回。第一版混合检索可以使用 `title contains + embedding ANN`，后续再升级到 sparse/BM25。
-
-## 七、Recall 客户端定位
-
-`app/recall/ann.py` 保留历史文件名，但后续不再把它理解成“自己实现 ANN 算法”。
-
-它的实际职责是封装 Milvus 混合检索策略：
-
-```text
-title 关键词检索
-  -> Milvus query/filter
-
-embedding 向量检索
-  -> Milvus search(anns_field="embedding")
-
-业务合并
-  -> item_id 去重
-  -> title + embedding 双路命中加权
-  -> 输出统一商品 dict
-```
-
-Milvus 仍然是数据库和 ANN 引擎，`ann.py` 只负责项目内可复用的召回策略。后续 `item_search.py` 和入库验证脚本都应复用这层能力，避免在多个地方重复写合并逻辑。
-
-## 八、搜索接口（item_search 工具签名）
-
-```python
-class CandidateItem(BaseModel):
-    """item_search 返回的候选商品。"""
+class Candidate(BaseModel):
+    """单个候选商品的稳定结构（后续工具按这个 schema 消费）。"""
     item_id: str
     platform: str
     title: str
-    price_cny: float | None = None
-    coupon_cny: float | None = None
-    final_price_cny: float | None = None
-    shop_name: str | None = None
+    price: float
+    currency: str
+    rating: float | None = None
     sales: int | None = None
     image_url: str | None = None
-    url: str | None = None
-    attributes: dict[str, Any] = Field(default_factory=dict)
+    attributes: dict = Field(default_factory=dict)  # 材质 / 风格等结构化属性
 
 
 class ItemSearchOutput(BaseModel):
     platform: str
-    query: str
-    candidates: list[CandidateItem]
-    total_recall: int = 0
-    truncated: bool = False
-    backend: str = "milvus"
-    notice: str | None = None
+    candidates: list[Candidate]
+    total_recall: int        # 召回总数（语义 + 个性化）
+    truncated: bool          # 是否因为 top_k 截断
 
 
 @tool
 async def item_search(
     query: str,
-    platform: Literal["all", "taobao", "jd", "pdd"] = "all",
+    platform: Literal["jd", "pdd", "taobao"],
     top_k: int = 20,
     user_id: str | None = None,
 ) -> ItemSearchOutput:
-    """从商品索引中检索国内电商候选商品。
+    """在指定平台检索商品候选集。
 
     Args:
-        query: Planner 拆解后的检索词。
-        platform: 平台过滤，可指定 taobao/jd/pdd，也可用 all。
+        query: 已经被 Planner 拆解过的具体词（例如 "旅行收纳袋 不要塑料 小众"）。
+        platform: 目标平台。
         top_k: 返回候选数量，默认 20，最大 50。
-        user_id: 可选用户 ID，预留个性化召回。
+        user_id: 可选，传入则启用个性化召回通道。
 
     Returns:
-        标准化候选商品列表。
+        platform / candidates / total_recall / truncated 四字段固定结构。
     """
+    ...
 ```
+
+## 六、三塔模型与 ItemSearch 的关系
+
+三塔模型不是第三方接口，而是项目内部的个性化商品检索模块。它负责把“用户这次想搜什么”“平台商品是什么”“这个用户长期喜欢什么”都变成向量，然后用相似度把更合适的商品召回出来。
+
+三塔分别是：
+
+- 查询塔：把 Planner 拆出来的 `query` 转成向量，例如 `轻便不塑料收纳包`。
+- 商品塔：把京东、拼多多、淘宝等平台商品的标题、材质、风格、价格等信息提前转成商品向量，存在向量库里。
+- 用户塔：把 `user_id` 对应的长期偏好转成用户向量，例如不爱塑料、喜欢小众、预算 200 以内。
+
+`item_search` 是对外工具入口，三塔模型是它底下的召回算法。
+
+不传 `user_id` 时，只跑查询塔 + 商品塔：只看这次搜索词和商品是否相关，所有人搜同一个词，结果大体一致。
+
+传 `user_id` 时，启用查询塔 + 商品塔 + 用户塔：既看这次搜什么，也看这个人长期偏好，排序会更个性化。
+
+例如同样搜 `收纳袋`：
+
+- 不传 `user_id`：召回大众收纳袋。
+- 传入“不爱塑料”的用户 ID：帆布、硅胶、小众材质商品会排得更靠前，塑料商品靠后。
+
+所以 `user_id` 在 `item_search` 里就是个性化开关：没有它就是通用检索，有它就是三塔个性化召回。
+
+## 七、工具内部：三塔召回接入
+
+### 6.1 三塔召回位置
+
+```text
+User 塔:  user_id -> user_emb
+Query 塔: query   -> query_emb
+Item 塔:  item    -> item_emb（离线灌入 Milvus）
+
+语义通道:
+query_emb 在 Milvus 中找 Top-K
+
+个性化通道:
+(user_emb + query_emb) 融合后在 Milvus 中找 Top-K
+
+合并:
+两个通道结果取并集 -> 去重 -> 重排
+```
+
+### 6.2 召回客户端抽象
+
+`TowerClient` 负责调用 User 塔和 Query 塔接口，输出 embedding。
+
+```python
+# app/recall/towers.py
+import os
+import httpx
+
+
+class TowerClient:
+    def __init__(self) -> None:
+        self.user_endpoint = os.environ["TOWER_USER_ENDPOINT"]
+        self.query_endpoint = os.environ["TOWER_QUERY_ENDPOINT"]
+        self.client = httpx.AsyncClient(timeout=5.0)
+
+    async def encode_user(self, user_id: str) -> list[float]:
+        r = await self.client.post(self.user_endpoint, json={"user_id": user_id})
+        r.raise_for_status()
+        return r.json()["embedding"]
+
+    async def encode_query(self, query: str) -> list[float]:
+        r = await self.client.post(self.query_endpoint, json={"query": query})
+        r.raise_for_status()
+        return r.json()["embedding"]
+
+
+tower_client = TowerClient()
+```
+
+`MilvusRecallClient` 负责在 Milvus 商品向量库里做近邻检索，并按平台过滤。
+
+```python
+# app/recall/milvus.py
+import os
+from pymilvus import MilvusClient
+
+
+class MilvusRecallClient:
+    def __init__(self) -> None:
+        self.client = MilvusClient(uri=os.environ["MILVUS_URI"])
+        self.collection_name = os.environ["MILVUS_ITEM_COLLECTION"]
+
+    def search(self, emb: list[float], top_k: int, platform: str) -> list[dict]:
+        results = self.client.search(
+            collection_name=self.collection_name,
+            data=[emb],
+            limit=top_k * 3,
+            filter=f'platform == "{platform}"',
+            output_fields=[
+                "item_id",
+                "platform",
+                "title",
+                "price",
+                "currency",
+                "rating",
+                "sales",
+                "image_url",
+                "attributes",
+            ],
+        )
+
+        items = []
+        for hit in results[0]:
+            entity = dict(hit.get("entity") or {})
+            items.append({**entity, "score": float(hit.get("distance", 0.0))})
+            if len(items) >= top_k:
+                break
+        return items
+
+
+milvus_recall_client = MilvusRecallClient()
+```
+
+### 6.3 双通道召回和合并
+
+```python
+# app/tools/item_search.py
+import asyncio
+
+from app.recall.towers import tower_client
+from app.recall.milvus import milvus_recall_client
+
+
+async def _recall(
+    query: str,
+    platform: str,
+    top_k: int,
+    user_id: str | None,
+) -> tuple[list[dict], int]:
+    semantic_task = asyncio.create_task(
+        _semantic_recall(query, platform, top_k)
+    )
+
+    personalized_task = (
+        asyncio.create_task(_personalized_recall(query, platform, top_k, user_id))
+        if user_id
+        else None
+    )
+
+    semantic = await semantic_task
+    personalized = await personalized_task if personalized_task else []
+
+    merged = _dedupe_and_rerank(semantic, personalized)
+    total_recall = len({item["item_id"] for item in semantic + personalized})
+    return merged[:top_k], total_recall
+
+
+async def _semantic_recall(query: str, platform: str, top_k: int) -> list[dict]:
+    query_emb = await tower_client.encode_query(query)
+    return milvus_recall_client.search(query_emb, top_k, platform)
+
+
+async def _personalized_recall(
+    query: str,
+    platform: str,
+    top_k: int,
+    user_id: str,
+) -> list[dict]:
+    user_emb, query_emb = await asyncio.gather(
+        tower_client.encode_user(user_id),
+        tower_client.encode_query(query),
+    )
+    fused = [0.6 * u + 0.4 * q for u, q in zip(user_emb, query_emb)]
+    return milvus_recall_client.search(fused, top_k, platform)
+
+
+def _dedupe_and_rerank(semantic: list[dict], personalized: list[dict]) -> list[dict]:
+    bag: dict[str, dict] = {}
+
+    for item in semantic:
+        bag[item["item_id"]] = {**item, "boost": item["score"]}
+
+    for item in personalized:
+        existing = bag.get(item["item_id"])
+        if existing:
+            existing["boost"] += 0.5 * item["score"]
+        else:
+            bag[item["item_id"]] = {**item, "boost": item["score"] * 0.8}
+
+    return sorted(bag.values(), key=lambda item: item["boost"], reverse=True)
+```
+
+### 6.4 工具入口
+
+```python
+# app/tools/item_search.py
+import time
+
+from app.api.monitor import monitor
+
+
+@tool
+async def item_search(
+    query: str,
+    platform: Literal["jd", "pdd", "taobao"],
+    top_k: int = 20,
+    user_id: str | None = None,
+) -> ItemSearchOutput:
+    """在指定平台检索商品候选集。"""
+    top_k = min(top_k, 50)
+    await monitor.report_tool_start("item_search", {
+        "query": query,
+        "platform": platform,
+        "top_k": top_k,
+    })
+
+    t0 = time.time()
+    raw, total_recall = await _recall(query, platform, top_k, user_id)
+
+    candidates = [
+        Candidate(
+            item_id=r["item_id"],
+            platform=platform,
+            title=r["title"],
+            price=r["price"],
+            currency=r["currency"],
+            rating=r.get("rating"),
+            sales=r.get("sales"),
+            image_url=r.get("image_url"),
+            attributes=r.get("attributes", {}),
+        )
+        for r in raw
+    ]
+
+    await monitor.report_tool_end("item_search", int((time.time() - t0) * 1000))
+    return ItemSearchOutput(
+        platform=platform,
+        candidates=candidates,
+        total_recall=total_recall,
+        truncated=total_recall > top_k,
+    )
+```
+
+### 6.5 整体流程
+
+```text
+Query 塔把 query 编码成 query_emb
+User 塔把 user_id 编码成 user_emb（可选）
+Item 塔提前把商品编码成 item_emb 并写入 Milvus
+
+不传 user_id:
+query_emb -> Milvus -> Top-K 商品
+
+传 user_id:
+query_emb -> Milvus -> 语义 Top-K
+user_emb + query_emb -> Milvus -> 个性化 Top-K
+两路结果 -> 去重 -> 重排 -> Candidate[]
+```
+
+## 八、设计取舍说明
+
+### platform 使用 Literal 而非 str
+
+限制固定枚举平台值，防止模型输出 Amazon / AMAZON / amzn 这类不规范字符串，统一入参格式，减少分支判断与兼容 bug。
+
+### top_k 默认值 20
+
+平衡两端：给到 ItemPicker 二次筛选有充足候选样本；同时不会一次性返回过长列表造成上下文 token 溢出。
+
+### user_id 可选参数
+
+无用户 ID 时走纯语义商品检索；传入用户 ID 则开启个性化召回（结合用户长期偏好），实现功能渐进增强。
+
+### 返回值为 Pydantic 模型
+
+LangChain 会自动将模型序列化为结构化文本供给 LLM 阅读；业务代码中可直接作为对象访问字段，兼顾模型理解与后端程序读写。
 
 ## 九、与其他工具的关系
 
 ```text
 Planner
-  -> 拆出预算 / 品类 / 偏好
+  -> 拆出预算 / 品类 / 配送偏好 / 包邮需求
 
 dispatch_tool
   -> fork 多个同质子 AgentLoop
   -> 每个子 loop 调一个平台的 item_search
 
 ItemSearch
-  -> title 关键词召回 + embedding 向量召回（Milvus ANN）
-  -> item_id 去重，双路命中加权重排
   -> 返回各平台候选商品
 
 主 AgentLoop
   -> 合流多个平台候选
 
+PriceCompare
+  -> 计算商品价 + 运费后的国内总价
+  -> 做同款 / 近似款比价
+
 ItemPicker
-  -> 按 attributes（材质/颜色/规格）和价格做二次筛选
-  -> 不再依赖 shop_type / rating / shipping（这些字段已砍）
+  -> 按材质、风格、品牌偏好、评价风险做二次筛选
 
 ShoppingSummary
   -> 生成最终采购建议
 ```
 
-ItemPicker 的评分逻辑需要同步调整（原来依赖 rating / shop_type / free_shipping / eta_days，这些字段移除后改为依赖 attributes + 价格 + 销量）。
+## 十、建议文件落点
 
-## 十、数据采集链路
+最小实现结构：
 
 ```text
-麦手 search API（60 条/页）
-  -> 写入临时表（item_id / platform / title / price_cny / ... / image_url）
-  -> 并发调 detail API 补 url（购买链接 + 口令）
-  -> 并发调多模态模型补 attributes（图片 + 标题 -> 结构化 JSON）
-  -> 拼 embedding_text
-  -> 调 embedding / Item Tower 生成 embedding
-  -> 写入 Milvus glodex_items
-  -> item_search 可查
+app/tools/
+└── item_search.py
 ```
+
+第一版先实现 `mock`。真实平台按顺序接：
+
+1. 京东联盟官方。
+2. 多多进宝官方。
+3. 万邦聚合补充淘宝。
 
 ## 十一、验收标准
 
-1. `item_search(platform="taobao" / "jd" / "pdd", ...)` 能在 Milvus 中完成 title + embedding 混合召回并返回统一结构。
+第一版完成后至少满足：
+
+1. `item_search(platform="jd" / "pdd" / "taobao", ...)` 能返回统一商品结构。
 2. schema 能被 LangChain `StructuredTool` 使用。
 3. 主 AgentLoop 可以通过 `dispatch_tool` fork 多个平台搜索任务。
 4. 多个平台结果可以合流回 `state.context.candidate_items`。
-5. `CandidateItem` 不再包含 shipping / rating / shop_type / tags / category 字段。
-6. `attributes` 由多模态模型（图+文）提取，不同品类返回不同属性字段。
-7. `url` 和 `image_url` 均为公网可访问 URL。
-8. ItemPicker 评分逻辑已适配新的精简字段。
+5. 国内运费和包邮信息已在商品字段中体现。
+6. 后续 `PriceCompare` 不需要再调用独立 `ShippingCalc`。
